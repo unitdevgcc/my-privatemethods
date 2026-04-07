@@ -467,6 +467,51 @@ static void close_session_socket(struct session_data *sd) {
     }
 }
 
+static void peer_sync_ts_from_raw(struct session_data *sd) {
+    char buf[576];
+    struct sockaddr_in ra;
+    socklen_t rlen;
+
+    if (!sd->use_ts)
+        return;
+
+    for (;;) {
+        rlen = sizeof(ra);
+        int ret = recvfrom(sd->raw_sock, buf, sizeof(buf), MSG_DONTWAIT,
+                           (struct sockaddr *)&ra, &rlen);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (ret < (int)(sizeof(struct iphdr) + sizeof(struct tcphdr)))
+            continue;
+        if (ra.sin_addr.s_addr != config.target_addr)
+            continue;
+
+        struct iphdr *iph = (struct iphdr *)buf;
+        int ip_hl = iph->ihl * 4;
+
+        if (ip_hl < (int)sizeof(struct iphdr) || iph->protocol != IPPROTO_TCP)
+            continue;
+        if (ret < ip_hl + (int)sizeof(struct tcphdr))
+            continue;
+
+        struct tcphdr *tcph = (struct tcphdr *)(buf + ip_hl);
+        int tcp_seg = (int)tcph->doff * 4;
+
+        if (ret < ip_hl + tcp_seg)
+            continue;
+        if (tcph->source != sd->dport || tcph->dest != sd->sport)
+            continue;
+
+        uint32_t tsval;
+
+        if (tcp_opts_get_tsval(tcph, ret - ip_hl, &tsval))
+            sd->ts_peer = tsval;
+    }
+}
+
 static int send_packet(struct session_data *sd, struct sockaddr_in *target_addr,
                       char *packet, int pkt_size, int payload_len) {
     struct iphdr *iph = (struct iphdr *)packet;
@@ -574,6 +619,7 @@ static void *session_thread(void *arg) {
 
     if (sd->is_flood) {
         while (config.running && time(NULL) < end_time) {
+            peer_sync_ts_from_raw(sd);
             int plen = gen_payload(&sd->rng, payload, MAX_PAYLOAD);
             int total = sizeof(struct iphdr) + sd->tcp_send_hlen + plen;
             if (send_packet(sd, &target_addr, packet, total, plen) > 0)
@@ -581,6 +627,7 @@ static void *session_thread(void *arg) {
         }
     } else {
         while (config.running && time(NULL) < end_time) {
+            peer_sync_ts_from_raw(sd);
             int plen = gen_payload(&sd->rng, payload, MAX_PAYLOAD);
             int total = sizeof(struct iphdr) + sd->tcp_send_hlen + plen;
             if (send_packet(sd, &target_addr, packet, total, plen) > 0)
