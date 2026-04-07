@@ -28,6 +28,11 @@
 #define TOTAL_SESSIONS (FLOOD_SESSIONS + STREAM_SESSIONS)
 #define MAX_PAYLOAD 1460
 #define STREAM_INTERVAL_US 2000
+
+#define TCP_HDRLEN_MIN 20
+
+#define TCP_OLEN_TIMESTAMP 12
+#define TCP_HDRLEN_TS (TCP_HDRLEN_MIN + TCP_OLEN_TIMESTAMP)
 #define DEFAULT_CONN_SNDBUF (4 * 1024 * 1024)
 #define DEFAULT_CONN_RCVBUF (4 * 1024 * 1024)
 #define DEFAULT_ADV_WINDOW 65535
@@ -77,6 +82,10 @@ struct session_data {
     int session_id;
     int is_flood;
     struct rng_state rng;
+    int use_ts;
+    int tcp_send_hlen;
+    uint32_t ts_local;
+    uint32_t ts_peer;
 };
 
 static struct exterogen_config config;
@@ -145,6 +154,68 @@ static uint16_t checksum_tcp(struct iphdr *iph, struct tcphdr *tcph,
     while (sum >> 16)
         sum = (sum & 0xFFFF) + (sum >> 16);
     return (uint16_t)~sum;
+}
+
+static uint32_t tcp_now_ts_ms(void) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return (uint32_t)time(NULL) * 1000u;
+    return (uint32_t)(ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000));
+}
+
+static int tcp_opts_get_tsval(const struct tcphdr *tcph, int seg_len, uint32_t *tsval_out) {
+    int hlen = (int)tcph->doff * 4;
+
+    if (hlen < (int)sizeof(struct tcphdr) || seg_len < hlen)
+        return 0;
+
+    const unsigned char *p = (const unsigned char *)tcph + sizeof(struct tcphdr);
+    int opt_len = hlen - (int)sizeof(struct tcphdr);
+    int i = 0;
+
+    while (i < opt_len) {
+        unsigned char kind = p[i];
+
+        if (kind == 0)
+            break;
+        if (kind == 1) {
+            i++;
+            continue;
+        }
+        if (i + 1 >= opt_len)
+            break;
+        unsigned char olen = p[i + 1];
+
+        if (olen < 2 || i + olen > opt_len)
+            break;
+        if (kind == 8 && olen >= 10) {
+            uint32_t raw;
+
+            memcpy(&raw, p + i + 2, sizeof(raw));
+            *tsval_out = ntohl(raw);
+            return 1;
+        }
+        i += olen;
+    }
+    return 0;
+}
+
+static void tcp_put_ts_opts(void *opt_start, uint32_t tsval, uint32_t tsecr) {
+    unsigned char *p = (unsigned char *)opt_start;
+
+    p[0] = 1;
+    p[1] = 1;
+    p[2] = 8;
+    p[3] = 10;
+    {
+        uint32_t be = htonl(tsval);
+        memcpy(p + 4, &be, sizeof(be));
+    }
+    {
+        uint32_t be = htonl(tsecr);
+        memcpy(p + 8, &be, sizeof(be));
+    }
 }
 
 static uint32_t get_local_ip(void) {
@@ -360,12 +431,13 @@ static int do_handshake(struct session_data *sd) {
 
             iph = (struct iphdr *)recv_buf;
             ip_hl = iph->ihl * 4;
-            if (ip_hl >= (int)sizeof(struct iphdr) &&
-                ret >= ip_hl + (int)sizeof(struct tcphdr) &&
-                iph->protocol == IPPROTO_TCP) {
+            if (ip_hl >= (int)sizeof(struct iphdr) && iph->protocol == IPPROTO_TCP) {
 
                 tcph = (struct tcphdr *)(recv_buf + ip_hl);
-                if (tcph->source == htons(config.target_port) &&
+                int tcp_bytes = (int)tcph->doff * 4;
+
+                if (ret >= ip_hl + tcp_bytes &&
+                    tcph->source == htons(config.target_port) &&
                     (expected_sport == 0 || tcph->dest == expected_sport) &&
                     tcph->syn && tcph->ack) {
 
@@ -373,6 +445,11 @@ static int do_handshake(struct session_data *sd) {
                     sd->ack_seq = ntohl(tcph->seq) + 1;
                     sd->sport = tcph->dest;
                     sd->dport = tcph->source;
+                    sd->use_ts = 0;
+                    if (tcp_opts_get_tsval(tcph, ret - ip_hl, &sd->ts_peer)) {
+                        sd->use_ts = 1;
+                        sd->ts_local = tcp_now_ts_ms();
+                    }
                     done = 1;
                     break;
                 }
@@ -394,6 +471,7 @@ static int send_packet(struct session_data *sd, struct sockaddr_in *target_addr,
                       char *packet, int pkt_size, int payload_len) {
     struct iphdr *iph = (struct iphdr *)packet;
     struct tcphdr *tcph = (struct tcphdr *)(packet + sizeof(struct iphdr));
+    int tcp_hlen = sd->tcp_send_hlen;
     int sent;
 
     iph->id = htons((uint16_t)(rng_next(&sd->rng) & 0xFFFF));
@@ -401,13 +479,21 @@ static int send_packet(struct session_data *sd, struct sockaddr_in *target_addr,
     tcph->ack_seq = htonl(sd->ack_seq);
     sd->seq += (uint32_t)payload_len;
 
+    if (sd->use_ts) {
+        tcph->doff = (uint16_t)(tcp_hlen / 4);
+        tcp_put_ts_opts((char *)tcph + sizeof(struct tcphdr), sd->ts_local, sd->ts_peer);
+        sd->ts_local++;
+    } else {
+        tcph->doff = 5;
+    }
+
     iph->tot_len = htons((uint16_t)pkt_size);
     iph->check = 0;
     iph->check = checksum_generic((uint16_t *)iph, sizeof(struct iphdr));
     tcph->check = 0;
     tcph->check = checksum_tcp(iph, tcph,
-                               htons((uint16_t)(sizeof(struct tcphdr) + payload_len)),
-                               sizeof(struct tcphdr) + payload_len);
+                               htons((uint16_t)(tcp_hlen + payload_len)),
+                               tcp_hlen + payload_len);
 
     sent = sendto(sd->raw_sock, packet, (size_t)pkt_size, MSG_NOSIGNAL,
                  (struct sockaddr *)target_addr, sizeof(*target_addr));
@@ -448,11 +534,14 @@ static void *session_thread(void *arg) {
         close(sd->raw_sock);
         return NULL;
     }
-    printf("[Session %d] Established (seq=%u, ack=%u) %s\n",
-           sd->session_id, sd->seq, sd->ack_seq, sd->is_flood ? "[flood]" : "[stream]");
+    sd->tcp_send_hlen = sd->use_ts ? TCP_HDRLEN_TS : TCP_HDRLEN_MIN;
+    printf("[Session %d] Established (seq=%u, ack=%u)%s %s\n",
+           sd->session_id, sd->seq, sd->ack_seq,
+           sd->use_ts ? " ts=on" : "",
+           sd->is_flood ? "[flood]" : "[stream]");
 
-    int pkt_size = sizeof(struct iphdr) + sizeof(struct tcphdr) + MAX_PAYLOAD;
-    char *packet = malloc(pkt_size);
+    int pkt_size = sizeof(struct iphdr) + TCP_HDRLEN_TS + MAX_PAYLOAD;
+    char *packet = malloc((size_t)pkt_size);
     if (!packet) {
         close(sd->raw_sock);
         return NULL;
@@ -460,7 +549,7 @@ static void *session_thread(void *arg) {
 
     struct iphdr *iph = (struct iphdr *)packet;
     struct tcphdr *tcph = (struct tcphdr *)(packet + sizeof(struct iphdr));
-    char *payload = packet + sizeof(struct iphdr) + sizeof(struct tcphdr);
+    char *payload = packet + sizeof(struct iphdr) + sd->tcp_send_hlen;
 
     memset(iph, 0, sizeof(struct iphdr));
     iph->version = 4;
@@ -486,14 +575,14 @@ static void *session_thread(void *arg) {
     if (sd->is_flood) {
         while (config.running && time(NULL) < end_time) {
             int plen = gen_payload(&sd->rng, payload, MAX_PAYLOAD);
-            int total = sizeof(struct iphdr) + sizeof(struct tcphdr) + plen;
+            int total = sizeof(struct iphdr) + sd->tcp_send_hlen + plen;
             if (send_packet(sd, &target_addr, packet, total, plen) > 0)
                 local_pkts++;
         }
     } else {
         while (config.running && time(NULL) < end_time) {
             int plen = gen_payload(&sd->rng, payload, MAX_PAYLOAD);
-            int total = sizeof(struct iphdr) + sizeof(struct tcphdr) + plen;
+            int total = sizeof(struct iphdr) + sd->tcp_send_hlen + plen;
             if (send_packet(sd, &target_addr, packet, total, plen) > 0)
                 local_pkts++;
             usleep(STREAM_INTERVAL_US);
