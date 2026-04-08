@@ -5,7 +5,7 @@ CC := gcc
 CFLAGS := -Wall -Wextra -O3 -pthread -fstack-protector-strong -fpie -D_FORTIFY_SOURCE=2
 LDFLAGS := -pthread -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -Wl,-z,defs
 
-TARGETS := exterogen.x86 exterogen.x64
+TARGETS := exterogen.x86 exterogen.x64 exterogen_mc.x86 exterogen_mc.x64
 CLEAN_TARGETS := exterogen.x86.clean exterogen.x64.clean
 
 .PHONY: all clean clean-build
@@ -20,6 +20,18 @@ exterogen.x86: exterogen.c
 
 exterogen.x64: exterogen.c
 	@echo "[*] compiling for x64..."
+	$(CC) -m64 $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@strip $@
+	@echo "[+] $@ ready"
+
+exterogen_mc.x86: exterogen_mc.c
+	@echo "[*] compiling exterogen_mc for x86..."
+	$(CC) -m32 $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@strip $@
+	@echo "[+] $@ ready"
+
+exterogen_mc.x64: exterogen_mc.c
+	@echo "[*] compiling exterogen_mc for x64..."
 	$(CC) -m64 $(CFLAGS) -o $@ $< $(LDFLAGS)
 	@strip $@
 	@echo "[+] $@ ready"
